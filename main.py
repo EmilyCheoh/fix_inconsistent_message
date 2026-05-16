@@ -1,5 +1,4 @@
 import json
-import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -10,64 +9,18 @@ from astrbot.api import logger
 class FixInconsistentMessage(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self._conversation_ref = None
-        self._send_count = 0
-        self._has_tool_call = False
+        self._last_echoed_tool_call_id = None
         logger.info("⚠️补救⚠️ Plugin loaded successfully.")
 
     @filter.on_llm_request()
     async def on_request(self, event: AstrMessageEvent, req):
-        """Store conversation reference and reset state."""
-        self._conversation_ref = getattr(req, "conversation", None)
-        self._send_count = 0
-        self._has_tool_call = False
-
-    @filter.on_decorating_result()
-    async def on_decorating(self, event: AstrMessageEvent):
-        """Track if this interaction involves a tool call (2+ sends = agent loop)."""
-        self._send_count += 1
-
-    @filter.after_message_sent()
-    async def after_sent(self, event: AstrMessageEvent):
-        """After final send, wait for persistence then read correct text from history."""
-        if self._send_count < 2:
-            return  # Not an agent loop interaction, skip
-
-        # Only act once per interaction (on the last after_message_sent)
-        if self._has_tool_call:
-            return
-        self._has_tool_call = True
-
-        conv = self._conversation_ref
-        if not conv:
+        """On each new message, check contexts for un-echoed generate_image text."""
+        contexts = getattr(req, "contexts", None)
+        if not contexts or not isinstance(contexts, list):
             return
 
-        # Schedule delayed read to let runner persist to conv.history
-        asyncio.create_task(self._delayed_echo(event, conv))
-
-    async def _delayed_echo(self, event: AstrMessageEvent, conv):
-        """Wait for runner to persist, then find and send correct text."""
-        await asyncio.sleep(3)
-
-        history_raw = getattr(conv, "history", None)
-        if not history_raw:
-            logger.warning("⚠️补救⚠️ conv.history empty after delay.")
-            return
-
-        try:
-            messages = json.loads(history_raw) if isinstance(history_raw, str) else history_raw
-        except json.JSONDecodeError:
-            logger.error("⚠️补救⚠️ Failed to parse conv.history after delay.")
-            return
-
-        if not isinstance(messages, list):
-            logger.warning(f"⚠️补救⚠️ Parsed history is not list: {type(messages).__name__}")
-            return
-
-        logger.info(f"⚠️补救⚠️ Delayed read: history len={len(messages)}")
-
-        # Search from end for assistant message with generate_image
-        for msg in reversed(messages):
+        # Search from end for most recent assistant msg with generate_image tool_call
+        for msg in reversed(contexts):
             if not isinstance(msg, dict):
                 continue
 
@@ -77,16 +30,21 @@ class FixInconsistentMessage(Star):
             if role != "assistant" or not tool_calls:
                 continue
 
-            has_gen_image = False
+            # Find generate_image tool_call
+            gen_image_tc_id = None
             for tc in tool_calls:
                 if isinstance(tc, dict):
                     fn_name = tc.get("function", {}).get("name", "")
                     if fn_name == "generate_image":
-                        has_gen_image = True
+                        gen_image_tc_id = tc.get("id", "")
                         break
 
-            if not has_gen_image:
+            if not gen_image_tc_id:
                 continue
+
+            # Check if we already echoed this one
+            if gen_image_tc_id == self._last_echoed_tool_call_id:
+                return  # Already handled, stop
 
             # Extract text
             content = msg.get("content", "")
@@ -100,13 +58,13 @@ class FixInconsistentMessage(Star):
                         text_parts.append(p.get("text", ""))
                 text = "\n".join(text_parts)
 
-            logger.info(f"⚠️补救⚠️ FOUND after delay. text={repr(text[:120]) if text else 'EMPTY'}")
-
             if text and text.strip():
+                logger.info(f"⚠️补救⚠️ Echoing text for tool_call {gen_image_tc_id}: {text.strip()[:80]}...")
                 await event.send(event.plain_result(text.strip()))
+                self._last_echoed_tool_call_id = gen_image_tc_id
                 logger.info("⚠️补救⚠️ Correct text sent.")
             else:
-                logger.warning("⚠️补救⚠️ Found msg but text empty.")
-            return
+                logger.info(f"⚠️补救⚠️ Found tool_call {gen_image_tc_id} but text is empty, skipping.")
+                self._last_echoed_tool_call_id = gen_image_tc_id
 
-        logger.info("⚠️补救⚠️ No generate_image found in history after delay.")
+            return  # Only process the most recent one
