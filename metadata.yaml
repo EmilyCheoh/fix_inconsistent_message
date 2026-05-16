@@ -1,0 +1,6 @@
+name: astrbot_plugin_fix_inconsistent_message
+display_name: "补救插件"
+desc: "Detects generate_image tool calls and re-sends the correct assistant text that QQ fails to deliver consistently."
+author: "Abyss AI"
+repo: ""
+version: "0.1.0"
