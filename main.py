@@ -3,50 +3,46 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("fix_inconsistent_message", "Abyss AI", "0.1.0",
+@register("astrbot_plugin_fix_inconsistent_message", "Abyss AI", "0.1.0",
           "Re-sends the correct assistant text that precedes a generate_image tool call.")
 class FixInconsistentMessage(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self._pending_echo_text: str | None = None
+        logger.info("⚠️补救⚠️ Plugin loaded successfully.")
 
-    def _extract_text_from_resp(self, resp) -> str | None:
-        """Extract assistant text from LLMResponse, with fallback to raw_completion."""
-        # Try _completion_text first
-        text = resp._completion_text
+    def _extract_text(self, resp) -> str | None:
+        """Extract assistant text from LLMResponse via multiple fallback paths."""
+        # Path 1: _completion_text
+        text = getattr(resp, "_completion_text", None)
         if text and text.strip():
             return text.strip()
 
-        # Fallback: parse from raw_completion (OpenAI ChatCompletion format)
-        raw = resp.raw_completion
+        # Path 2: raw_completion as OpenAI ChatCompletion object
+        raw = getattr(resp, "raw_completion", None)
         if raw is None:
             return None
 
         try:
-            # OpenAI SDK object: raw.choices[0].message.content
-            message = raw.choices[0].message
-            content = message.content
+            content = raw.choices[0].message.content
             if isinstance(content, str) and content.strip():
                 return content.strip()
-            # If content is a list of parts (multimodal format)
             if isinstance(content, list):
-                text_parts = [p["text"] for p in content if p.get("type") == "text"]
-                joined = "\n".join(text_parts).strip()
+                parts = [p["text"] for p in content if p.get("type") == "text"]
+                joined = "\n".join(parts).strip()
                 if joined:
                     return joined
         except (AttributeError, IndexError, KeyError, TypeError):
             pass
 
-        # Fallback: raw_completion might be a dict
+        # Path 3: raw_completion as dict
         if isinstance(raw, dict):
             try:
-                message = raw["choices"][0]["message"]
-                content = message.get("content", "")
+                content = raw["choices"][0]["message"].get("content", "")
                 if isinstance(content, str) and content.strip():
                     return content.strip()
                 if isinstance(content, list):
-                    text_parts = [p["text"] for p in content if p.get("type") == "text"]
-                    joined = "\n".join(text_parts).strip()
+                    parts = [p["text"] for p in content if p.get("type") == "text"]
+                    joined = "\n".join(parts).strip()
                     if joined:
                         return joined
             except (KeyError, IndexError, TypeError):
@@ -55,21 +51,17 @@ class FixInconsistentMessage(Star):
         return None
 
     @filter.on_llm_response()
-    async def capture_pre_tool_text(self, event: AstrMessageEvent, resp):
-        """When LLM responds with a generate_image tool call, store the accompanying text."""
-        if resp.tools_call_name and "generate_image" in resp.tools_call_name:
-            text = self._extract_text_from_resp(resp)
-            if text:
-                self._pending_echo_text = text
-                logger.info(f"[fix_inconsistent_message] Captured: {text[:80]}...")
-            else:
-                self._pending_echo_text = None
-                logger.warning("[fix_inconsistent_message] generate_image detected but no text found in response.")
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """When LLM responds with generate_image tool call, re-send the correct text."""
+        tool_names = getattr(resp, "tools_call_name", None)
+        if not tool_names or "generate_image" not in tool_names:
+            return
 
-    @filter.on_llm_tool_respond()
-    async def echo_after_tool(self, event: AstrMessageEvent, tool, tool_args, tool_result):
-        """After generate_image completes, send the stored text to the user."""
-        if tool.name == "generate_image" and self._pending_echo_text:
-            logger.info(f"[fix_inconsistent_message] Sending captured text to user.")
-            await event.send(event.plain_result(self._pending_echo_text))
-            self._pending_echo_text = None
+        logger.info("⚠️补救⚠️ generate_image detected in tool_calls.")
+
+        text = self._extract_text(resp)
+        if text:
+            logger.info(f"⚠️补救⚠️ Sending text: {text[:80]}...")
+            await event.send(event.plain_result(text))
+        else:
+            logger.warning("⚠️补救⚠️ generate_image detected but no text extracted.")
