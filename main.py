@@ -1,4 +1,5 @@
 import json
+import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -9,43 +10,64 @@ from astrbot.api import logger
 class FixInconsistentMessage(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self._contexts_ref = None  # live reference to req.contexts
+        self._conversation_ref = None
         self._send_count = 0
+        self._has_tool_call = False
         logger.info("⚠️补救⚠️ Plugin loaded successfully.")
 
     @filter.on_llm_request()
     async def on_request(self, event: AstrMessageEvent, req):
-        """Store live contexts reference and reset send counter."""
-        self._contexts_ref = getattr(req, "contexts", None)
+        """Store conversation reference and reset state."""
+        self._conversation_ref = getattr(req, "conversation", None)
         self._send_count = 0
-        logger.info(f"⚠️补救⚠️ on_llm_request: contexts type={type(self._contexts_ref).__name__}, "
-                    f"len={len(self._contexts_ref) if self._contexts_ref else 0}")
+        self._has_tool_call = False
+
+    @filter.on_decorating_result()
+    async def on_decorating(self, event: AstrMessageEvent):
+        """Track if this interaction involves a tool call (2+ sends = agent loop)."""
+        self._send_count += 1
 
     @filter.after_message_sent()
     async def after_sent(self, event: AstrMessageEvent):
-        """After 2nd send, check live contexts for generate_image tool_call text."""
-        self._send_count += 1
-
+        """After final send, wait for persistence then read correct text from history."""
         if self._send_count < 2:
+            return  # Not an agent loop interaction, skip
+
+        # Only act once per interaction (on the last after_message_sent)
+        if self._has_tool_call:
+            return
+        self._has_tool_call = True
+
+        conv = self._conversation_ref
+        if not conv:
             return
 
-        contexts = self._contexts_ref
-        if not contexts:
-            logger.warning("⚠️补救⚠️ No contexts reference.")
+        # Schedule delayed read to let runner persist to conv.history
+        asyncio.create_task(self._delayed_echo(event, conv))
+
+    async def _delayed_echo(self, event: AstrMessageEvent, conv):
+        """Wait for runner to persist, then find and send correct text."""
+        await asyncio.sleep(3)
+
+        history_raw = getattr(conv, "history", None)
+        if not history_raw:
+            logger.warning("⚠️补救⚠️ conv.history empty after delay.")
             return
 
-        logger.info(f"⚠️补救⚠️ after_message_sent #2: contexts len={len(contexts)}")
+        try:
+            messages = json.loads(history_raw) if isinstance(history_raw, str) else history_raw
+        except json.JSONDecodeError:
+            logger.error("⚠️补救⚠️ Failed to parse conv.history after delay.")
+            return
 
-        # Log last 5 messages for debugging
-        for i, msg in enumerate(contexts[-5:]):
-            if isinstance(msg, dict):
-                role = msg.get("role", "?")
-                has_tc = "tool_calls" in msg
-                content_preview = str(msg.get("content", ""))[:60]
-                logger.info(f"⚠️补救⚠️ contexts[-{5-i}]: role={role}, has_tool_calls={has_tc}, content={content_preview}")
+        if not isinstance(messages, list):
+            logger.warning(f"⚠️补救⚠️ Parsed history is not list: {type(messages).__name__}")
+            return
+
+        logger.info(f"⚠️补救⚠️ Delayed read: history len={len(messages)}")
 
         # Search from end for assistant message with generate_image
-        for msg in reversed(contexts):
+        for msg in reversed(messages):
             if not isinstance(msg, dict):
                 continue
 
@@ -78,13 +100,13 @@ class FixInconsistentMessage(Star):
                         text_parts.append(p.get("text", ""))
                 text = "\n".join(text_parts)
 
-            logger.info(f"⚠️补救⚠️ FOUND tool_call msg. text={repr(text[:120]) if text else 'EMPTY'}")
+            logger.info(f"⚠️补救⚠️ FOUND after delay. text={repr(text[:120]) if text else 'EMPTY'}")
 
             if text and text.strip():
                 await event.send(event.plain_result(text.strip()))
                 logger.info("⚠️补救⚠️ Correct text sent.")
             else:
-                logger.warning("⚠️补救⚠️ Found message but text is empty.")
+                logger.warning("⚠️补救⚠️ Found msg but text empty.")
             return
 
-        logger.info("⚠️补救⚠️ No generate_image tool_call found in live contexts.")
+        logger.info("⚠️补救⚠️ No generate_image found in history after delay.")
