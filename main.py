@@ -52,8 +52,19 @@ class FixInconsistentMessage(Star):
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp):
-        """When LLM responds with generate_image tool call, re-send the correct text."""
+        """Debug: log every LLM response to see what's in resp."""
         tool_names = getattr(resp, "tools_call_name", None)
+        completion_text = getattr(resp, "_completion_text", None)
+        raw = getattr(resp, "raw_completion", None)
+
+        logger.info(f"⚠️补救⚠️ on_llm_response fired. tools_call_name={tool_names}, "
+                    f"_completion_text={repr(completion_text[:100]) if completion_text else None}, "
+                    f"raw_completion type={type(raw).__name__}")
+
+        # Log all attributes of resp for debugging
+        attrs = [a for a in dir(resp) if not a.startswith("__")]
+        logger.info(f"⚠️补救⚠️ resp attributes: {attrs}")
+
         if not tool_names or "generate_image" not in tool_names:
             return
 
@@ -61,7 +72,7 @@ class FixInconsistentMessage(Star):
 
         text = self._extract_text(resp)
         if text:
-            logger.info(f"⚠️补救⚠️ Sending text: {text[:80]}...")
+            logger.info(f"⚠️补救��️ Sending text: {text[:80]}...")
             await event.send(event.plain_result(text))
         else:
             logger.warning("⚠️补救⚠️ generate_image detected but no text extracted.")
